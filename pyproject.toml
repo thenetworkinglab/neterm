@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neterm"
+dynamic = ["version"]
+description = "A lightweight terminal emulator for network elements (serial, telnet, SSH)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "GPL-3.0-or-later"}
+dependencies = [
+    "pyserial>=3.5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+]
+
+[project.scripts]
+neterm = "neterm.cli:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "neterm.__version__"}
+
+[tool.setuptools.packages.find]
+where = ["src"]

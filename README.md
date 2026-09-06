@@ -72,7 +72,7 @@ Press `Ctrl+O` to start logging. All session output is written to a timestamped 
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  neterm 0.1.0  /dev/ttyUSB0 @ 9600bps  [LOG: 20260331_...]      │  title bar
+│  neterm 0.2.0  /dev/ttyUSB0 @ 9600bps  [LOG: 20260331_...]      │  title bar
 │                                                                 │
 │  Router> show version                                           │  terminal
 │  Cisco IOS Software ...                                         │  area

@@ -6,13 +6,17 @@
 
 Layout (nano-style):
   ┌─────────────────────────────────────────┐
-  │  neterm 0.2.2  serial:/dev/ttyUSB0 9600 │  <- title bar (reverse video)
+  │  neterm 0.3.0  serial:/dev/ttyUSB0 9600 │  <- title bar (reverse video)
   │                                         │
   │  ... terminal output ...                │  <- VT100 screen area
   │                                         │
   │  CTS:● DSR:● DCD:○ RI:○  RTS:● DTR:●  │  <- signal bar (serial only)
-  │  ^X Exit  ^L Clear  ^B Break  ^T Toggle │  <- help bar (reverse video)
+  │  ^]x Exit ^]l Clear ^]b Break ^]m Mouse │  <- help bar (reverse video)
   └─────────────────────────────────────────┘
+
+All input goes to the host; local commands hide behind the ^] prefix
+(telnet's escape key), so hosts keep ^X/^L/^B/etc. ^]^] sends a
+literal ^].
 
 Terminal emulation is provided by pyte (VT100/VT102 + parts of VT220):
 incoming bytes are fed to a pyte ByteStream which maintains a screen
@@ -70,6 +74,11 @@ COLOR_MAP = {
     "cyan": curses.COLOR_CYAN,
     "white": curses.COLOR_WHITE,
 }
+
+# Command prefix key: ^] (0x1D), telnet's escape character — chosen
+# because host applications essentially never use it (unlike ^A/^B/^X,
+# which nano, emacs, and shells all need).
+COMMAND_KEY = 0x1D
 
 # DECCKM: private mode 1, application cursor keys (ESC[?1h / ESC[?1l)
 DECCKM = 1
@@ -167,6 +176,7 @@ class Terminal:
         self._scroll_mode = False  # True when user is browsing scrollback
         self._pending = bytearray()  # data held while browsing scrollback
         self._mouse_scroll = False  # mouse scroll off by default (text selection works)
+        self._cmd_pending = False  # True after ^] prefix, awaiting command key
         # (fg, bg) -> curses color pair number, allocated lazily
         self._pairs: dict = {}
         self._next_pair = 10  # 1-6 are reserved for the chrome
@@ -406,6 +416,37 @@ class Terminal:
         except Exception:
             pass
 
+    def _handle_command(self, key: int) -> None:
+        """Handle the key following the ^] command prefix.
+
+        Accepts plain letters and their Ctrl variants (^]^X works like
+        ^]x). Unrecognized keys cancel the prefix silently.
+        """
+        if key in (ord("x"), ord("X"), 24):  # exit
+            self._running = False
+        elif key in (ord("l"), ord("L"), 12):  # clear screen + scrollback
+            with self._lock:
+                self._vt.reset()
+                self._vt.history.top.clear()
+                self._vt.history.bottom.clear()
+                self._pending.clear()
+                self._scroll_mode = False
+                self._repaint = True
+        elif key in (ord("b"), ord("B"), 2):  # send break (serial only)
+            if hasattr(self.conn, "send_break"):
+                self.conn.send_break()
+        elif key in (ord("m"), ord("M"), ord("g"), ord("G"), 7):  # mouse scroll
+            self._mouse_scroll = not self._mouse_scroll
+            if self._mouse_scroll:
+                curses.mousemask(curses.BUTTON4_PRESSED | BUTTON5_PRESSED)
+            else:
+                curses.mousemask(0)
+        elif key in (ord("o"), ord("O"), 15):  # toggle session logging
+            if self._log_file:
+                self._close_log()
+            else:
+                self._open_log()
+
     def _handle_input(self) -> None:
         """Process keyboard input."""
         try:
@@ -416,43 +457,21 @@ class Terminal:
         if key == -1:
             return
 
-        # Ctrl+X — exit
-        if key == 24:  # ^X
-            self._running = False
-            return
-
-        # Ctrl+L — reset emulator screen and scrollback
-        if key == 12:  # ^L
-            with self._lock:
-                self._vt.reset()
-                self._vt.history.top.clear()
-                self._vt.history.bottom.clear()
-                self._pending.clear()
-                self._scroll_mode = False
-                self._repaint = True
-            return
-
-        # Ctrl+B — send break (serial only)
-        if key == 2:  # ^B
-            if hasattr(self.conn, "send_break"):
-                self.conn.send_break()
-            return
-
-        # Ctrl+G — toggle mouse scroll (off = native text selection works)
-        if key == 7:  # ^G
-            self._mouse_scroll = not self._mouse_scroll
-            if self._mouse_scroll:
-                curses.mousemask(curses.BUTTON4_PRESSED | BUTTON5_PRESSED)
+        # Command prefix ^] (telnet's escape char — no host app uses it).
+        # All other control keys pass through to the host, so nano's ^X,
+        # emacs's ^B etc. work normally.
+        if key == COMMAND_KEY:
+            if not self._cmd_pending:
+                self._cmd_pending = True
             else:
-                curses.mousemask(0)
+                # ^] ^] — send a literal ^] to the host
+                self._cmd_pending = False
+                self._send(bytes([COMMAND_KEY]))
             return
 
-        # Ctrl+O — toggle session logging on/off
-        if key == 15:  # ^O
-            if self._log_file:
-                self._close_log()
-            else:
-                self._open_log()
+        if self._cmd_pending:
+            self._cmd_pending = False
+            self._handle_command(key)
             return
 
         # Terminal resize
@@ -622,6 +641,8 @@ class Terminal:
             title += f" [LOG: {os.path.basename(self._log_path)}]"
         if self._scroll_mode:
             title += " [SCROLL]"
+        if self._cmd_pending:
+            title += " [^] ...]"
         title = title.ljust(cols)[:cols]
         try:
             self._screen.addstr(row, 0, title[:cols - 1], curses.color_pair(1))
@@ -724,11 +745,11 @@ class Terminal:
         mouse_label = "Mouse:ON" if self._mouse_scroll else "Mouse:OFF"
         log_label = "Log:ON" if self._log_file else "Log:OFF"
         help_items = [
-            ("^X", "Exit"),
-            ("^L", "Clear"),
-            ("^B", "Break"),
-            ("^G", mouse_label),
-            ("^O", log_label),
+            ("^]x", "Exit"),
+            ("^]l", "Clear"),
+            ("^]b", "Break"),
+            ("^]m", mouse_label),
+            ("^]o", log_label),
             ("PgUp/Dn", "Scroll"),
         ]
         help_text = "  ".join(f"{k} {v}" for k, v in help_items)

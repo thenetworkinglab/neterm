@@ -2,6 +2,17 @@
 
 All notable changes to neterm are documented in this file.
 
+## [0.3.0] - 2026-09-07
+
+### Changed
+
+- **New keybinding scheme**: local commands moved behind a `Ctrl+]`
+  prefix (telnet's escape key), so every control character — nano's
+  `^X`, emacs's `^B`, `^L` redraws — now reaches the host. `^]x` exit,
+  `^]l` clear, `^]b` break, `^]m` mouse, `^]o` log, `^]^]` sends a
+  literal `Ctrl+]`. The old direct `^X`/`^L`/`^B`/`^G`/`^O` bindings
+  are gone.
+
 ## [0.2.2] - 2026-09-07
 
 ### Fixed

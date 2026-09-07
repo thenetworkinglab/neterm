@@ -50,35 +50,43 @@ neterm telnet router.local -p 2323
 
 ## Keyboard Shortcuts
 
-| Key      | Action                                    |
-|----------|-------------------------------------------|
-| `Ctrl+X` | Exit                                      |
-| `Ctrl+L` | Clear scrollback                          |
-| `Ctrl+B` | Send break (serial only)                  |
-| `Ctrl+G` | Toggle mouse scrolling on/off             |
-| `Ctrl+O` | Toggle session logging on/off             |
-| `PgUp`   | Scroll up                                 |
-| `PgDn`   | Scroll down                               |
-| `Home`   | Scroll to top                             |
-| `End`    | Snap to bottom (follow mode)              |
+All keys — including control characters like `Ctrl+X` and `Ctrl+C` — are
+sent to the host, so full-screen applications (nano, vi, installers)
+work normally. Local commands hide behind the `Ctrl+]` prefix, telnet's
+classic escape key, which host applications essentially never use.
 
-Mouse scrolling is off by default so that native text selection works in your terminal. Toggle it on with `Ctrl+G` when you need to scroll through output with the mouse wheel.
+| Key             | Action                                    |
+|-----------------|-------------------------------------------|
+| `Ctrl+]` `x`    | Exit                                      |
+| `Ctrl+]` `l`    | Clear screen and scrollback               |
+| `Ctrl+]` `b`    | Send break (serial only)                  |
+| `Ctrl+]` `m`    | Toggle mouse scrolling on/off             |
+| `Ctrl+]` `o`    | Toggle session logging on/off             |
+| `Ctrl+]` `Ctrl+]` | Send a literal `Ctrl+]` to the host     |
+| `PgUp`          | Scroll up                                 |
+| `PgDn`          | Scroll down                               |
+| `End`           | Snap to bottom (follow mode)              |
+
+The command letter also works with Ctrl held (`Ctrl+]` `Ctrl+X` exits,
+like plain `Ctrl+]` `x`). Any other key after the prefix cancels it.
+
+Mouse scrolling is off by default so that native text selection works in your terminal. Toggle it on with `Ctrl+]` `m` when you need to scroll through output with the mouse wheel.
 
 ## Session Logging
 
-Press `Ctrl+O` to start logging. All session output is written to a timestamped file in `~/.neterm/logs/`. Press `Ctrl+O` again to stop logging and close the file. Starting logging again creates a new file. The log file name is shown in the title bar while logging is active.
+Press `Ctrl+]` `o` to start logging. All session output is written to a timestamped file in `~/.neterm/logs/`. Press `Ctrl+]` `o` again to stop logging and close the file. Starting logging again creates a new file. The log file name is shown in the title bar while logging is active.
 
 ## Screen Layout
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  neterm 0.2.2  /dev/ttyUSB0 @ 9600bps  [LOG: 20260331_...]      │  title bar
+│  neterm 0.3.0  /dev/ttyUSB0 @ 9600bps  [LOG: 20260331_...]      │  title bar
 │                                                                 │
 │  Router> show version                                           │  terminal
 │  Cisco IOS Software ...                                         │  area
 │                                                                 │
 │  Rx:● Tx:○ RTS:● DTR:● CTS:● DSR:● DCD:○ RI:○                   │  signal bar
-│  ^X Exit  ^L Clear  ^B Break  ^G Mouse  ^O Log  PgUp/Dn Scroll  │  help bar
+│  ^]x Exit  ^]l Clear  ^]b Break  ^]m Mouse  ^]o Log  PgUp/Dn    │  help bar
 └─────────────────────────────────────────────────────────────────┘
 ```
 

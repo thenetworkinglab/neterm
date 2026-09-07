@@ -6,21 +6,30 @@
 
 Layout (nano-style):
   ┌─────────────────────────────────────────┐
-  │  neterm 0.1.0  serial:/dev/ttyUSB0 9600 │  <- title bar (reverse video)
+  │  neterm 0.2.0  serial:/dev/ttyUSB0 9600 │  <- title bar (reverse video)
   │                                         │
-  │  ... terminal output ...                │  <- scrollable terminal area
+  │  ... terminal output ...                │  <- VT100 screen area
   │                                         │
   │  CTS:● DSR:● DCD:○ RI:○  RTS:● DTR:●  │  <- signal bar (serial only)
   │  ^X Exit  ^L Clear  ^B Break  ^T Toggle │  <- help bar (reverse video)
   └─────────────────────────────────────────┘
+
+Terminal emulation is provided by pyte (VT100/VT102 + parts of VT220):
+incoming bytes are fed to a pyte ByteStream which maintains a screen
+grid with cursor position and per-character attributes; we paint that
+grid into the curses window. Outgoing special keys (arrows, function
+keys, etc.) are encoded as VT100 escape sequences.
 """
 
 import curses
+import locale
 import os
 import threading
 import time
 from datetime import datetime
 from typing import Optional
+
+import pyte
 
 from neterm import __version__
 from neterm.connections.base import Connection
@@ -28,6 +37,105 @@ from neterm.connections.base import Connection
 
 # How often (seconds) to poll for incoming data and refresh signals
 POLL_INTERVAL = 0.02  # 50 Hz
+
+# Scrollback history (lines)
+HISTORY_LINES = 10000
+
+# While browsing scrollback we hold incoming data so pyte's history
+# pagination isn't corrupted mid-view; cap how much we hold.
+MAX_PENDING = 1024 * 1024
+
+# pyte color name -> curses color constant
+COLOR_MAP = {
+    "black": curses.COLOR_BLACK,
+    "red": curses.COLOR_RED,
+    "green": curses.COLOR_GREEN,
+    "brown": curses.COLOR_YELLOW,
+    "blue": curses.COLOR_BLUE,
+    "magenta": curses.COLOR_MAGENTA,
+    "cyan": curses.COLOR_CYAN,
+    "white": curses.COLOR_WHITE,
+}
+
+# DECCKM: private mode 1, application cursor keys (ESC[?1h / ESC[?1l)
+DECCKM = 1
+
+# Arrow keys: final byte is shared, the prefix depends on DECCKM
+# (normal: ESC[A, application mode: ESC OA — set by full-screen hosts).
+ARROW_KEYS = {
+    curses.KEY_UP: b"A",
+    curses.KEY_DOWN: b"B",
+    curses.KEY_RIGHT: b"C",
+    curses.KEY_LEFT: b"D",
+}
+ARROW_FINALS = (b"A", b"B", b"C", b"D")
+
+# curses key -> VT100 escape sequence
+KEY_SEQUENCES = {
+    curses.KEY_DC: b"\x1b[3~",
+    curses.KEY_IC: b"\x1b[2~",
+    curses.KEY_F1: b"\x1bOP",
+    curses.KEY_F2: b"\x1bOQ",
+    curses.KEY_F3: b"\x1bOR",
+    curses.KEY_F4: b"\x1bOS",
+    curses.KEY_F5: b"\x1b[15~",
+    curses.KEY_F6: b"\x1b[17~",
+    curses.KEY_F7: b"\x1b[18~",
+    curses.KEY_F8: b"\x1b[19~",
+    curses.KEY_F9: b"\x1b[20~",
+    curses.KEY_F10: b"\x1b[21~",
+    curses.KEY_F11: b"\x1b[23~",
+    curses.KEY_F12: b"\x1b[24~",
+}
+
+
+class _Vt100Screen(pyte.HistoryScreen):
+    """pyte screen that can answer host queries (DA/DSR) over the connection."""
+
+    def __init__(self, columns: int, lines: int, respond) -> None:
+        super().__init__(columns, lines, history=HISTORY_LINES)
+        self._respond = respond
+        # Cursor key encoding: the vt100 terminfo entry advertises the
+        # application (SS3, ESC O x) form, and hosts like the Solaris
+        # installer match it literally without ever sending DECCKM — so
+        # SS3 is the default until the host explicitly resets the mode.
+        self.cursor_keys_app = True
+
+    def write_process_input(self, data: str) -> None:
+        # Cursor-position / device-attribute reports requested by the host
+        self._respond(data.encode("ascii", errors="ignore"))
+
+    # pyte fills erased cells with the *current* SGR attributes (BCE
+    # semantics), so e.g. clearing while reverse video is active leaves
+    # reverse-video blanks. A real VT100 has no back-color-erase: erased
+    # cells always revert to plain default background.
+
+    def _erase_with_default_attrs(self, op, *args, **kwargs) -> None:
+        saved = self.cursor.attrs
+        self.cursor.attrs = self.default_char
+        try:
+            op(*args, **kwargs)
+        finally:
+            self.cursor.attrs = saved
+
+    def erase_in_line(self, *args, **kwargs) -> None:
+        self._erase_with_default_attrs(super().erase_in_line, *args, **kwargs)
+
+    def erase_in_display(self, *args, **kwargs) -> None:
+        self._erase_with_default_attrs(super().erase_in_display, *args, **kwargs)
+
+    def erase_characters(self, *args, **kwargs) -> None:
+        self._erase_with_default_attrs(super().erase_characters, *args, **kwargs)
+
+    def set_mode(self, *modes, **kwargs) -> None:
+        super().set_mode(*modes, **kwargs)
+        if kwargs.get("private") and DECCKM in modes:
+            self.cursor_keys_app = True
+
+    def reset_mode(self, *modes, **kwargs) -> None:
+        super().reset_mode(*modes, **kwargs)
+        if kwargs.get("private") and DECCKM in modes:
+            self.cursor_keys_app = False
 
 
 class Terminal:
@@ -37,13 +145,17 @@ class Terminal:
         self.conn = connection
         self._running = False
         self._screen: Optional[curses.window] = None
-        self._term_win: Optional[curses.window] = None
         self._lock = threading.Lock()
-        # Scrollback buffer: list of lines (bytes decoded to str)
-        self._lines: list[str] = [""]
-        self._scroll_offset = 0  # line index of the top of the viewport
+        # VT100 emulation (created once curses is up and we know our size)
+        self._vt: Optional[_Vt100Screen] = None
+        self._stream: Optional[pyte.ByteStream] = None
+        self._repaint = True  # full repaint of the terminal area needed
         self._scroll_mode = False  # True when user is browsing scrollback
+        self._pending = bytearray()  # data held while browsing scrollback
         self._mouse_scroll = False  # mouse scroll off by default (text selection works)
+        # (fg, bg) -> curses color pair number, allocated lazily
+        self._pairs: dict = {}
+        self._next_pair = 10  # 1-6 are reserved for the chrome
         # Session log
         self._log_dir = log_dir or os.path.join(os.path.expanduser("~"), ".neterm", "logs")
         self._log_file: Optional[object] = None
@@ -56,11 +168,20 @@ class Terminal:
 
     def run(self) -> None:
         """Start the terminal UI (blocks until exit)."""
+        # Needed so curses can output the Unicode box-drawing characters
+        # produced by the VT100 line-drawing charset.
+        locale.setlocale(locale.LC_ALL, "")
+        # Don't make the user wait after pressing bare ESC (default 1000ms);
+        # hosts like the Solaris installer use ESC-digit key chords.
+        os.environ.setdefault("ESCDELAY", "25")
         curses.wrapper(self._main)
 
     def _main(self, stdscr: curses.window) -> None:
         self._screen = stdscr
         curses.curs_set(1)
+        # Raw mode: deliver ^C, ^Z, ^S/^Q etc. as input bytes to forward to
+        # the host instead of signalling neterm. ^X stays the local exit key.
+        curses.raw()
         stdscr.nodelay(True)
         stdscr.keypad(True)
 
@@ -88,6 +209,17 @@ class Terminal:
             stdscr.getch()
             return
 
+        # Create the VT100 screen sized to the visible terminal area.
+        # Must happen after open(): whether the signal bar exists (and thus
+        # how tall the terminal area is) depends on the live connection.
+        _, cols = stdscr.getmaxyx()
+        self._vt = _Vt100Screen(max(2, cols), self._get_term_height(), self._respond)
+        self._stream = pyte.ByteStream(self._vt)
+        # pyte's UTF-8 mode ignores VT100 charset switching (ESC(0, SI/SO),
+        # which full-screen hosts use for line-drawing. A real VT100 isn't
+        # UTF-8 anyway; hosts can re-enable it with ESC%G.
+        self._stream.use_utf8 = False
+
         self._running = True
 
         # Start reader thread
@@ -101,6 +233,13 @@ class Terminal:
             self.conn.close()
             if self._log_file:
                 self._close_log()
+
+    def _respond(self, data: bytes) -> None:
+        """Send an emulator-generated reply (DA/DSR reports) to the host."""
+        try:
+            self.conn.write(data)
+        except Exception:
+            pass
 
     def _open_log(self) -> None:
         os.makedirs(self._log_dir, exist_ok=True)
@@ -127,7 +266,7 @@ class Terminal:
             self._log_file.flush()
 
     def _reader_thread(self) -> None:
-        """Background thread that reads from the connection into the buffer."""
+        """Background thread that reads from the connection into the emulator."""
         while self._running:
             try:
                 data = self.conn.read(4096)
@@ -136,44 +275,19 @@ class Terminal:
 
             if data:
                 now = time.monotonic()
+                self._log(data.decode("utf-8", errors="replace"))
                 with self._lock:
                     self._rx_active = True
                     self._rx_time = now
-                    self._process_incoming(data)
+                    if self._scroll_mode:
+                        # Hold data while the user browses scrollback
+                        if len(self._pending) < MAX_PENDING:
+                            self._pending.extend(data)
+                    else:
+                        self._stream.feed(data)
+                        self._repaint = True
 
             time.sleep(POLL_INTERVAL)
-
-    def _process_incoming(self, data: bytes) -> None:
-        """Decode incoming bytes and append to the line buffer.
-
-        Handles CR, LF, CR+LF, and basic backspace.
-        """
-        try:
-            text = data.decode("utf-8", errors="replace")
-        except Exception:
-            text = data.decode("latin-1", errors="replace")
-
-        self._log(text)
-
-        for ch in text:
-            if ch == "\r":
-                continue  # handled by \n or standalone CR
-            elif ch == "\n":
-                self._lines.append("")
-            elif ch == "\b" or ch == "\x7f":
-                if self._lines[-1]:
-                    self._lines[-1] = self._lines[-1][:-1]
-            elif ch == "\t":
-                self._lines[-1] += "    "
-            elif ord(ch) >= 32 or ch in ("\x1b",):
-                # Printable or escape (we pass through raw for now)
-                self._lines[-1] += ch
-
-        # Limit scrollback to ~10000 lines
-        max_lines = 10000
-        if len(self._lines) > max_lines:
-            excess = len(self._lines) - max_lines
-            self._lines = self._lines[excess:]
 
     def _event_loop(self) -> None:
         """Main input/render loop."""
@@ -189,30 +303,74 @@ class Terminal:
 
             curses.napms(int(POLL_INTERVAL * 1000))
 
-    def _scroll_up(self, lines: int) -> None:
-        """Scroll up by `lines`. Clamps at the top of the buffer."""
-        h = self._get_term_height()
-        with self._lock:
-            if not self._scroll_mode:
-                # Enter scroll mode: start from the bottom
-                self._scroll_mode = True
-                bottom = max(0, len(self._lines) - h)
-                self._scroll_offset = max(0, bottom - lines)
-            else:
-                self._scroll_offset = max(0, self._scroll_offset - lines)
+    def _at_bottom(self) -> bool:
+        return self._vt.history.position >= self._vt.history.size
 
-    def _scroll_down(self, lines: int) -> None:
-        """Scroll down by `lines`. Snaps back to follow mode at the bottom."""
-        h = self._get_term_height()
+    def _scroll_up(self) -> None:
+        with self._lock:
+            self._scroll_mode = True
+            self._vt.prev_page()
+            self._repaint = True
+
+    def _scroll_down(self) -> None:
         with self._lock:
             if not self._scroll_mode:
-                return  # already at bottom, nothing to do
-            bottom = max(0, len(self._lines) - h)
-            self._scroll_offset = min(bottom, self._scroll_offset + lines)
-            if self._scroll_offset >= bottom:
-                # Reached the bottom — exit scroll mode
-                self._scroll_mode = False
-                self._scroll_offset = 0
+                return
+            self._vt.next_page()
+            if self._at_bottom():
+                self._exit_scroll_locked()
+            self._repaint = True
+
+    def _exit_scroll_locked(self) -> None:
+        """Snap back to the live screen. Caller must hold the lock."""
+        while not self._at_bottom():
+            self._vt.next_page()
+        self._scroll_mode = False
+        if self._pending:
+            self._stream.feed(bytes(self._pending))
+            self._pending.clear()
+        self._repaint = True
+
+    def _send_arrow(self, final: bytes) -> None:
+        """Send an arrow key, honoring the host's DECCKM cursor key mode."""
+        with self._lock:
+            app_mode = self._vt.cursor_keys_app
+        self._send((b"\x1bO" if app_mode else b"\x1b[") + final)
+
+    def _read_escape_tail(self) -> bytes:
+        """Collect the bytes following a bare ESC from the keyboard.
+
+        Returns b"" for a lone ESC press, a single byte for an Alt/Esc
+        chord (e.g. Esc-2), or a full CSI/SS3 sequence tail like b"[B".
+        """
+        deadline = time.monotonic() + 0.05
+        tail = bytearray()
+        while time.monotonic() < deadline:
+            ch = self._screen.getch()
+            if ch == -1:
+                curses.napms(2)
+                continue
+            if ch > 255:  # curses special key; not part of a byte sequence
+                curses.ungetch(ch)
+                break
+            tail.append(ch)
+            if tail[0] == ord("["):
+                if len(tail) > 1 and 0x40 <= ch <= 0x7E:  # CSI final byte
+                    break
+            elif tail[0] == ord("O"):
+                if len(tail) > 1:  # SS3 is one byte after 'O'
+                    break
+            else:  # Esc-<char> chord — done
+                break
+        return bytes(tail)
+
+    def _send(self, data: bytes) -> None:
+        try:
+            self.conn.write(data)
+            self._tx_active = True
+            self._tx_time = time.monotonic()
+        except Exception:
+            pass
 
     def _handle_input(self) -> None:
         """Process keyboard input."""
@@ -229,12 +387,15 @@ class Terminal:
             self._running = False
             return
 
-        # Ctrl+L — clear screen buffer
+        # Ctrl+L — reset emulator screen and scrollback
         if key == 12:  # ^L
             with self._lock:
-                self._lines = [""]
-                self._scroll_offset = 0
+                self._vt.reset()
+                self._vt.history.top.clear()
+                self._vt.history.bottom.clear()
+                self._pending.clear()
                 self._scroll_mode = False
+                self._repaint = True
             return
 
         # Ctrl+B — send break (serial only)
@@ -260,50 +421,67 @@ class Terminal:
                 self._open_log()
             return
 
+        # Terminal resize
+        if key == curses.KEY_RESIZE:
+            with self._lock:
+                _, cols = self._screen.getmaxyx()
+                self._vt.resize(self._get_term_height(), max(2, cols))
+                self._repaint = True
+            return
+
         # Page Up / Page Down for scrollback
         if key == curses.KEY_PPAGE:
-            self._scroll_up(self._get_term_height())
+            self._scroll_up()
             return
 
         if key == curses.KEY_NPAGE:
-            self._scroll_down(self._get_term_height())
+            self._scroll_down()
             return
 
-        # Home — scroll to top
-        if key == curses.KEY_HOME:
-            with self._lock:
-                self._scroll_offset = 0
-                self._scroll_mode = True
-            return
-
-        # End — snap back to follow mode
+        # End — snap back to the live screen
         if key == curses.KEY_END:
             with self._lock:
-                self._scroll_offset = 0
-                self._scroll_mode = False
+                if self._scroll_mode:
+                    self._exit_scroll_locked()
             return
 
         # Mouse scroll
         if key == curses.KEY_MOUSE:
             try:
                 _, _, _, _, bstate = curses.getmouse()
-                scroll_lines = 3  # lines per scroll tick
                 if bstate & curses.BUTTON4_PRESSED:  # scroll up
-                    self._scroll_up(scroll_lines)
+                    self._scroll_up()
                 elif bstate & curses.BUTTON5_PRESSED:  # scroll down
-                    self._scroll_down(scroll_lines)
+                    self._scroll_down()
             except curses.error:
                 pass
             return
 
+        # Arrow keys — prefix depends on the host-set cursor key mode
+        final = ARROW_KEYS.get(key)
+        if final is not None:
+            self._send_arrow(final)
+            return
+
+        # Bare ESC — could be a lone ESC press, an Esc-digit chord, or an
+        # arrow/function sequence our outer terminal's terminfo didn't match
+        if key == 27:
+            rest = self._read_escape_tail()
+            if len(rest) == 2 and rest[0] in b"[O" and rest[1:] in ARROW_FINALS:
+                self._send_arrow(rest[1:])
+            else:
+                self._send(b"\x1b" + rest)
+            return
+
+        # Other special keys — encode as VT100 sequences
+        seq = KEY_SEQUENCES.get(key)
+        if seq is not None:
+            self._send(seq)
+            return
+
         # Backspace — curses may report as KEY_BACKSPACE (263), 127, or 8
         if key in (curses.KEY_BACKSPACE, 127, 8):
-            try:
-                self.conn.write(b"\x7f")
-                self._tx_active = True
-                self._tx_time = time.monotonic()
-            except Exception:
-                pass
+            self._send(b"\x7f")
             return
 
         # Regular key — send to connection
@@ -312,12 +490,7 @@ class Terminal:
             # Translate Enter to CR (standard for serial terminals)
             if key in (curses.KEY_ENTER, 10, 13):
                 ch = b"\r"
-            try:
-                self.conn.write(ch)
-                self._tx_active = True
-                self._tx_time = time.monotonic()
-            except Exception:
-                pass
+            self._send(ch)
 
     def _get_term_height(self) -> int:
         """Height available for the terminal text area."""
@@ -328,10 +501,40 @@ class Terminal:
             chrome += 1
         return max(1, rows - chrome)
 
+    def _char_attr(self, char) -> int:
+        """Map a pyte Char's attributes to a curses attribute."""
+        attr = 0
+        if char.bold:
+            attr |= curses.A_BOLD
+        if char.underscore:
+            attr |= curses.A_UNDERLINE
+        if char.reverse:
+            attr |= curses.A_REVERSE
+        if char.blink:
+            attr |= curses.A_BLINK
+
+        if curses.has_colors():
+            fg = COLOR_MAP.get(char.fg.replace("bright", ""), -1)
+            bg = COLOR_MAP.get(char.bg.replace("bright", ""), -1)
+            if char.fg.startswith("bright"):
+                attr |= curses.A_BOLD
+            if (fg, bg) != (-1, -1):
+                pair = self._pairs.get((fg, bg))
+                if pair is None and self._next_pair < curses.COLOR_PAIRS:
+                    pair = self._next_pair
+                    try:
+                        curses.init_pair(pair, fg, bg)
+                        self._pairs[(fg, bg)] = pair
+                        self._next_pair += 1
+                    except curses.error:
+                        pair = None
+                if pair is not None:
+                    attr |= curses.color_pair(pair)
+        return attr
+
     def _draw(self) -> None:
-        """Redraw the entire screen."""
+        """Redraw the screen chrome every frame; terminal area when dirty."""
         try:
-            self._screen.erase()
             rows, cols = self._screen.getmaxyx()
             if rows < 3 or cols < 20:
                 return
@@ -356,29 +559,29 @@ class Terminal:
                 self._draw_signal_bar(signal_row, cols)
             self._draw_help_bar(help_row, cols)
 
-            # Position cursor at the end of the last visible line
+            # Position the cursor where the emulator says it is
             with self._lock:
-                total = len(self._lines)
-                if not self._scroll_mode:
-                    visible_lines = min(total, term_height)
-                    cursor_row = term_start + visible_lines - 1
-                    cursor_col = len(self._lines[-1]) if self._lines else 0
-                else:
-                    cursor_row = term_start
-                    cursor_col = 0
-            cursor_col = min(cursor_col, cols - 1)
-            cursor_row = min(cursor_row, rows - 1)
+                hidden = self._vt.cursor.hidden or self._scroll_mode
+                cursor_row = term_start + self._vt.cursor.y
+                cursor_col = self._vt.cursor.x
             try:
-                self._screen.move(cursor_row, cursor_col)
+                curses.curs_set(0 if hidden else 1)
             except curses.error:
                 pass
+            if not hidden:
+                try:
+                    self._screen.move(
+                        min(cursor_row, rows - 1), min(cursor_col, cols - 1)
+                    )
+                except curses.error:
+                    pass
 
             self._screen.refresh()
         except curses.error:
             pass
 
     def _draw_title_bar(self, row: int, cols: int) -> None:
-        title = f" neterm {__version__}  {self.conn.name} "
+        title = f" neterm {__version__}  {self.conn.name}  VT100"
         if not self.conn.is_open:
             title += " [DISCONNECTED]"
         if self._log_file:
@@ -393,25 +596,46 @@ class Terminal:
 
     def _draw_terminal(self, start_row: int, height: int, cols: int) -> None:
         with self._lock:
-            total = len(self._lines)
-            if not self._scroll_mode:
-                # Follow mode: show the last `height` lines
-                begin = max(0, total - height)
-            else:
-                begin = self._scroll_offset
-            end = min(begin + height, total)
-            visible = self._lines[begin:end]
+            if not (self._repaint or self._vt.dirty):
+                return
+            dirty_all = self._repaint
+            dirty = set(self._vt.dirty)
+            self._vt.dirty.clear()
+            self._repaint = False
 
-        for i, line in enumerate(visible):
-            row = start_row + i
-            if row >= start_row + height:
-                break
-            # Truncate long lines
-            display = line[:cols]
-            try:
-                self._screen.addstr(row, 0, display)
-            except curses.error:
-                pass
+            buffer = self._vt.buffer
+            vt_lines = min(self._vt.lines, height)
+            for y in range(vt_lines):
+                if not dirty_all and y not in dirty:
+                    continue
+                row = start_row + y
+                line = buffer[y]
+                # Draw runs of identical attributes with one addstr each
+                x = 0
+                while x < min(self._vt.columns, cols):
+                    char = line[x]
+                    attr = self._char_attr(char)
+                    run = [char.data]
+                    x2 = x + 1
+                    while x2 < min(self._vt.columns, cols):
+                        nxt = line[x2]
+                        if self._char_attr(nxt) != attr:
+                            break
+                        run.append(nxt.data)
+                        x2 += 1
+                    try:
+                        self._screen.addstr(row, x, "".join(run), attr)
+                    except curses.error:
+                        pass
+                    x = x2
+                # Clear anything to the right of the emulated screen
+                if self._vt.columns < cols:
+                    try:
+                        self._screen.addstr(
+                            row, self._vt.columns, " " * (cols - self._vt.columns - 1)
+                        )
+                    except curses.error:
+                        pass
 
     def _draw_signal_bar(self, row: int, cols: int) -> None:
         """Draw RS-232 signal status bar."""
@@ -443,13 +667,12 @@ class Terminal:
         col = 1
         for label, active in parts:
             if active:
-                indicator = "\u25cf"  # filled circle ●
+                indicator = "●"  # filled circle ●
                 attr = curses.color_pair(5) | curses.A_BOLD
             else:
-                indicator = "\u25cb"  # empty circle ○
+                indicator = "○"  # empty circle ○
                 attr = curses.color_pair(6)
 
-            text = f"{label}:{indicator} "
             try:
                 # Label part
                 self._screen.addstr(row, col, f"{label}:", bar_attr)

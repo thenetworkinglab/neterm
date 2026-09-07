@@ -11,6 +11,7 @@ requires-python = ">=3.9"
 license = {text = "GPL-3.0-or-later"}
 dependencies = [
     "pyserial>=3.5",
+    "pyte>=0.8.2",
 ]
 
 [project.optional-dependencies]

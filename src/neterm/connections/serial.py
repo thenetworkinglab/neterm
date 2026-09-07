@@ -54,6 +54,24 @@ class SerialConnection(Connection):
             return self._serial.read(min(size, self._serial.in_waiting))
         return b""
 
+    def read_wait(self, size: int = 1024, timeout: float = 0.02) -> bytes:
+        """Block on the port (up to `timeout`) and return what arrived.
+
+        Uses the driver's own blocking read, so bytes are delivered the
+        moment they exist instead of on a polling grid.
+        """
+        if not self._serial.is_open:
+            return b""
+        if self._serial.timeout != timeout:
+            self._serial.timeout = timeout
+        data = self._serial.read(1)
+        if not data:
+            return b""
+        waiting = self._serial.in_waiting
+        if waiting:
+            data += self._serial.read(min(size - 1, waiting))
+        return data
+
     def write(self, data: bytes) -> None:
         if self._serial.is_open:
             self._serial.write(data)

@@ -2,6 +2,21 @@
 
 All notable changes to neterm are documented in this file.
 
+## [0.2.2] - 2026-09-07
+
+### Fixed
+
+- UI stutter on (USB-)serial connections: modem signals were queried
+  from the draw loop ~100×/second, each query a batch of driver ioctls
+  that can block for milliseconds. The reader thread now polls them 5×/
+  second into a cache the UI reads. The signal bar looks and behaves
+  the same.
+- Choppy output pacing: incoming data was picked up on a 20 ms polling
+  grid and drawn on another, adding 0–40 ms of random latency per line.
+  The reader now blocks on the device itself (new `read_wait` on
+  connections) and the UI draws at 100 Hz, cutting line-arrival jitter
+  to ~7 ms.
+
 ## [0.2.1] - 2026-09-06
 
 ### Fixed

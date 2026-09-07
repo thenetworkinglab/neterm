@@ -6,7 +6,7 @@
 
 Layout (nano-style):
   ┌─────────────────────────────────────────┐
-  │  neterm 0.2.1  serial:/dev/ttyUSB0 9600 │  <- title bar (reverse video)
+  │  neterm 0.2.2  serial:/dev/ttyUSB0 9600 │  <- title bar (reverse video)
   │                                         │
   │  ... terminal output ...                │  <- VT100 screen area
   │                                         │
@@ -35,8 +35,17 @@ from neterm import __version__
 from neterm.connections.base import Connection
 
 
-# How often (seconds) to poll for incoming data and refresh signals
-POLL_INTERVAL = 0.02  # 50 Hz
+# Reader thread: max wait inside a blocking read before rechecking state
+POLL_INTERVAL = 0.02
+
+# UI loop frame time. Short so freshly received data reaches the screen
+# quickly; a frame costs well under a millisecond, so this stays cheap.
+DRAW_INTERVAL = 0.01  # 100 Hz
+
+# How often (seconds) to poll modem signals. Each poll is several ioctls
+# against the (USB-)serial driver, which can block for milliseconds, so
+# it happens in the reader thread — never in the UI loop.
+SIGNAL_POLL_INTERVAL = 0.2
 
 # Scrollback history (lines)
 HISTORY_LINES = 10000
@@ -164,6 +173,10 @@ class Terminal:
         # Session log
         self._log_dir = log_dir or os.path.join(os.path.expanduser("~"), ".neterm", "logs")
         self._log_file: Optional[object] = None
+        # Modem signal cache, refreshed by the reader thread; the UI loop
+        # must never query the device directly
+        self._signals: Optional[dict] = None
+        self._has_signals = False
         # Track Tx/Rx activity for blinking indicators
         self._rx_active = False
         self._tx_active = False
@@ -217,6 +230,8 @@ class Terminal:
         # Create the VT100 screen sized to the visible terminal area.
         # Must happen after open(): whether the signal bar exists (and thus
         # how tall the terminal area is) depends on the live connection.
+        self._signals = self.conn.get_signals()
+        self._has_signals = self._signals is not None
         _, cols = stdscr.getmaxyx()
         self._vt = _Vt100Screen(max(2, cols), self._get_term_height(), self._respond)
         self._stream = pyte.ByteStream(self._vt)
@@ -271,10 +286,26 @@ class Terminal:
             self._log_file.flush()
 
     def _reader_thread(self) -> None:
-        """Background thread that reads from the connection into the emulator."""
+        """Background thread that reads from the connection into the emulator.
+
+        Also refreshes the modem signal cache, keeping potentially slow
+        driver ioctls off the UI thread.
+        """
+        last_signal_poll = 0.0
         while self._running:
+            if self._has_signals:
+                now = time.monotonic()
+                if now - last_signal_poll >= SIGNAL_POLL_INTERVAL:
+                    last_signal_poll = now
+                    try:
+                        self._signals = self.conn.get_signals()
+                    except Exception:
+                        pass
+
             try:
-                data = self.conn.read(4096)
+                # Blocks on the device until data arrives (or timeout), so
+                # bytes hit the screen with no polling-grid latency
+                data = self.conn.read_wait(4096, POLL_INTERVAL)
             except Exception:
                 break
 
@@ -292,8 +323,6 @@ class Terminal:
                         self._stream.feed(data)
                         self._repaint = True
 
-            time.sleep(POLL_INTERVAL)
-
     def _event_loop(self) -> None:
         """Main input/render loop."""
         while self._running:
@@ -306,7 +335,7 @@ class Terminal:
             if self._tx_active and now - self._tx_time > self._activity_duration:
                 self._tx_active = False
 
-            curses.napms(int(POLL_INTERVAL * 1000))
+            curses.napms(int(DRAW_INTERVAL * 1000))
 
     def _at_bottom(self) -> bool:
         return self._vt.history.position >= self._vt.history.size
@@ -502,7 +531,7 @@ class Terminal:
         rows, _ = self._screen.getmaxyx()
         # title bar (1) + signal bar (1 if serial) + help bar (1)
         chrome = 2  # title + help
-        if self.conn.get_signals() is not None:
+        if self._has_signals:
             chrome += 1
         return max(1, rows - chrome)
 
@@ -544,7 +573,7 @@ class Terminal:
             if rows < 3 or cols < 20:
                 return
 
-            has_signals = self.conn.get_signals() is not None
+            has_signals = self._has_signals
 
             # Row allocation
             title_row = 0
@@ -643,8 +672,8 @@ class Terminal:
                         pass
 
     def _draw_signal_bar(self, row: int, cols: int) -> None:
-        """Draw RS-232 signal status bar."""
-        signals = self.conn.get_signals()
+        """Draw RS-232 signal status bar (from the reader thread's cache)."""
+        signals = self._signals
 
         bar_attr = curses.color_pair(4)
 

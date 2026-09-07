@@ -4,6 +4,7 @@
 
 """Abstract base class for all connection types."""
 
+import time
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -26,6 +27,19 @@ class Connection(ABC):
     @abstractmethod
     def write(self, data: bytes) -> None:
         """Write data to the connection."""
+
+    def read_wait(self, size: int = 1024, timeout: float = 0.02) -> bytes:
+        """Read up to `size` bytes, waiting up to `timeout` for data.
+
+        Subclasses should override with a real blocking wait on the
+        underlying device so data is delivered the moment it arrives;
+        this default just polls read() across one sleep.
+        """
+        data = self.read(size)
+        if data:
+            return data
+        time.sleep(timeout)
+        return self.read(size)
 
     @property
     @abstractmethod

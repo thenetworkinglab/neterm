@@ -2,6 +2,15 @@
 
 All notable changes to neterm are documented in this file.
 
+## [0.2.1] - 2026-09-06
+
+### Fixed
+
+- Crash on `^G` (mouse scroll toggle) with Python builds whose curses
+  lacks `BUTTON5_PRESSED` (ncurses mouse protocol v1, e.g. python.org
+  macOS builds). Mouse scroll-up still works there; scroll-down isn't
+  reported by such builds — use PgDn.
+
 ## [0.2.0] - 2026-09-06
 
 ### Added

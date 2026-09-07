@@ -6,7 +6,7 @@
 
 Layout (nano-style):
   ┌─────────────────────────────────────────┐
-  │  neterm 0.2.0  serial:/dev/ttyUSB0 9600 │  <- title bar (reverse video)
+  │  neterm 0.2.1  serial:/dev/ttyUSB0 9600 │  <- title bar (reverse video)
   │                                         │
   │  ... terminal output ...                │  <- VT100 screen area
   │                                         │
@@ -44,6 +44,11 @@ HISTORY_LINES = 10000
 # While browsing scrollback we hold incoming data so pyte's history
 # pagination isn't corrupted mid-view; cap how much we hold.
 MAX_PENDING = 1024 * 1024
+
+# Missing when Python's curses is linked against an ncurses with mouse
+# protocol v1 (e.g. python.org macOS builds): no scroll-wheel-down
+# constant exists there, so mouse scroll-down is unavailable.
+BUTTON5_PRESSED = getattr(curses, "BUTTON5_PRESSED", 0)
 
 # pyte color name -> curses color constant
 COLOR_MAP = {
@@ -408,7 +413,7 @@ class Terminal:
         if key == 7:  # ^G
             self._mouse_scroll = not self._mouse_scroll
             if self._mouse_scroll:
-                curses.mousemask(curses.BUTTON4_PRESSED | curses.BUTTON5_PRESSED)
+                curses.mousemask(curses.BUTTON4_PRESSED | BUTTON5_PRESSED)
             else:
                 curses.mousemask(0)
             return
@@ -451,7 +456,7 @@ class Terminal:
                 _, _, _, _, bstate = curses.getmouse()
                 if bstate & curses.BUTTON4_PRESSED:  # scroll up
                     self._scroll_up()
-                elif bstate & curses.BUTTON5_PRESSED:  # scroll down
+                elif BUTTON5_PRESSED and bstate & BUTTON5_PRESSED:  # scroll down
                     self._scroll_down()
             except curses.error:
                 pass
